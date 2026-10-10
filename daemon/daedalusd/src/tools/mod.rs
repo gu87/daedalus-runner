@@ -127,9 +127,16 @@ pub trait Tool: Send + Sync {
 /// existing parent instead.  Verify the result is within `work_dir`.
 /// Used by [`file_read`](crate::tools::file_read::FileReadTool).
 pub(crate) fn resolve_read_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf, String> {
+    // 展开 ~ 为 HOME
+    let expanded: String = if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}{}", home, &raw[1..])
+    } else {
+        raw.to_string()
+    };
     let cwd =
         std::fs::canonicalize(work_dir).map_err(|e| format!("cannot resolve work_dir: {e}"))?;
-    let joined = cwd.join(raw);
+    let joined = cwd.join(&expanded);
 
     // Try the full path first; fall back to parent if NotFound.
     match std::fs::canonicalize(&joined) {
@@ -166,9 +173,16 @@ pub(crate) fn resolve_read_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf
 /// existing ancestor and checks that instead.  `..` components are
 /// rejected early as an escape attempt.
 pub(crate) fn resolve_write_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf, String> {
+    // 展开 ~ 为 HOME
+    let expanded: String = if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{}{}", home, &raw[1..])
+    } else {
+        raw.to_string()
+    };
     // Reject ParentDir components using Path::components().
     // This catches ".." without false-positives on filenames containing "..".
-    let raw_path = std::path::Path::new(raw);
+    let raw_path = std::path::Path::new(&expanded);
     for comp in raw_path.components() {
         if comp == std::path::Component::ParentDir {
             return Err(format!("path '{raw}' must not contain '..'"));
@@ -177,7 +191,7 @@ pub(crate) fn resolve_write_path(raw: &str, work_dir: &PathBuf) -> Result<PathBu
 
     let cwd =
         std::fs::canonicalize(work_dir).map_err(|e| format!("cannot resolve work_dir: {e}"))?;
-    let joined = cwd.join(raw);
+    let joined = cwd.join(&expanded);
     let parent = joined
         .parent()
         .ok_or_else(|| format!("path '{raw}' has no parent directory"))?;

@@ -1,6 +1,6 @@
 #!/bin/bash
 BASE=/home/hatch/workspace/daedalus-runner
-pkill -f "daedalus-runner/proxy/proxy.py" 2>/dev/null
+pkill -f "proxy/proxy.py" 2>/dev/null
 pkill -f "daedalus-runner/daemon/target/debug/daedalusd" 2>/dev/null
 sleep 1
 nohup python3 $BASE/proxy/proxy.py > /tmp/proxy.log 2>&1 &

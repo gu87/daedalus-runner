@@ -1036,7 +1036,6 @@ impl AgentLoop {
                 provider_error: None,
             });
         }
-
         let tool = self.tool_registry.get(&tc.name).ok_or_else(|| AgentError {
             reason: ErrorKind::ToolFailure,
             detail: format!("unknown tool: {}", tc.name),
