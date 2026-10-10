@@ -28,6 +28,18 @@
 
 路由：大福按任务难度选档（人肉网关 v0.1）。
 
+## 工具（daemon）
+
+daemon 内置工具（`daemon/daedalusd/src/tools/`）：
+
+| 工具 | 用途 |
+|------|------|
+| file_read / file_write | 读 / 写工作区文件 |
+| terminal | 执行 shell 命令 |
+| web_fetch | 抓网页，去 HTML 取正文 |
+| web_search | Tavily 搜索：走本地代理 :8899 注入凭证，返回标题/链接/摘要，查资料、查文档、查时事 |
+| task_done | 收尾：summary + 改动文件清单 |
+
 ## 启动
 
 ```bash
@@ -44,6 +56,12 @@ b = DaedalusBackend(base_url='http://127.0.0.1:9800')
 rid = b.dispatch(TaskSpec(agent_id='code-worker', goal='...'))
 result = b.get_result(rid)  # 轮询
 ```
+
+## 自愈机制
+
+派活前自动体检（`dispatch/tools/delegate_runtime/backend.py` 的 `ensure_daedalus_alive`）：
+检查 daemon（:9800/api/health）和代理（:8899/v1/models），哪个挂了就跑 `scripts/start-all.sh` 自动拉起，等 3 秒复检。
+体检跑在调用方进程里，死不了。可用环境变量 `DAEDALUS_NO_AUTOHEAL=1` 关掉。
 
 ## 目录
 
