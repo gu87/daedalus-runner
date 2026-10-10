@@ -2,7 +2,7 @@ agents:
   # 跑腿三档，我按任务派
   trivial-worker:
     role_summary: 干杂活：改格式、重命名、跑测试、简单文件操作。快而便宜。
-    tools: [file_read, file_write, terminal, task_done, web_fetch]
+    tools: [file_read, file_write, terminal, task_done, web_fetch, web_search]
     permission: auto
     model_strategy:
       primary:
@@ -12,7 +12,7 @@ agents:
 
   code-worker:
     role_summary: 写代码：实现功能、修 bug、重构。需要代码能力。
-    tools: [file_read, file_write, terminal, task_done, web_fetch]
+    tools: [file_read, file_write, terminal, task_done, web_fetch, web_search]
     permission: auto
     model_strategy:
       primary:
@@ -22,7 +22,7 @@ agents:
 
   think-worker:
     role_summary: 动脑子：设计方案、review 代码、分析问题。需要推理能力。
-    tools: [file_read, file_write, terminal, task_done, web_fetch]
+    tools: [file_read, file_write, terminal, task_done, web_fetch, web_search]
     permission: auto
     model_strategy:
       primary:

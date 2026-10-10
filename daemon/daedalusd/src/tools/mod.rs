@@ -16,6 +16,7 @@ pub mod registry;
 pub mod task_done;
 pub mod terminal;
 pub mod web_fetch;
+pub mod web_search;
 
 use std::path::PathBuf;
 

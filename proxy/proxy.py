@@ -9,21 +9,42 @@ UPSTREAM = "https://opencode.ai/zen/go"
 CRED = "custom.opencode-go"
 HOSTS = ["opencode.ai"]
 
+TAVILY_UPSTREAM = "https://api.tavily.com"
+TAVILY_CRED = "custom.tavily"
+TAVILY_HOSTS = ["api.tavily.com"]
+
 class Handler(BaseHTTPRequestHandler):
     def _forward(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else None
         path = self.path
-        if path.startswith("/v1/"):
-            path = path[3:]
-        url = UPSTREAM + "/v1" + path
+
+        # Tavily 搜索走单独的上游和凭证
+        if path.startswith("/tavily/"):
+            upstream = TAVILY_UPSTREAM
+            cred = TAVILY_CRED
+            hosts = TAVILY_HOSTS
+            url = upstream + path[7:]  # 去掉 /tavily 前缀
+            extra_headers = {}
+        else:
+            upstream = UPSTREAM
+            cred = CRED
+            hosts = HOSTS
+            if path.startswith("/v1/"):
+                path = path[3:]
+            url = upstream + "/v1" + path
+            extra_headers = {
+                "User-Agent": "daedalus-proxy/0.1",
+                "x-opencode-session": "daedalus-worker-v1",
+            }
+
         req = urllib.request.Request(url, data=body, method=self.command)
         ct = self.headers.get("Content-Type")
         if ct:
             req.add_header("Content-Type", ct)
-        add_surrogate_to_request(req, CRED, allowed_hosts=HOSTS)
-        req.add_header("User-Agent", "daedalus-proxy/0.1")
-        req.add_header("x-opencode-session", "daedalus-worker-v1")
+        add_surrogate_to_request(req, cred, allowed_hosts=hosts)
+        for k, v in extra_headers.items():
+            req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data = read_response_body(resp)
