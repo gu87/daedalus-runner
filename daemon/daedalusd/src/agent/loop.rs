@@ -1,0 +1,1111 @@
+//! Agent tool-use loop — the core state machine.
+//!
+//! Nine states per [`LoopState`].  Cancel/timeout share `Failed` with
+//! distinct [`ErrorKind`] values.  A [`CancelReason`] allows the loop to
+//! distinguish *why* cancellation was requested.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::select;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::ModelStrategy;
+use crate::error::{AgentError, ErrorKind};
+use crate::llm::router::Router;
+use crate::llm::StreamHandle;
+use crate::tools::registry::ToolRegistry;
+use crate::types::{
+    ChatMessage, Message, NarrativeSpeak, Outbox, PermissionDecision, StreamChunk, TaskCard,
+    TaskStream, ToolCall, ToolDef, ToolResult,
+};
+
+use super::heartbeat::HeartbeatLoop;
+use super::permission::PermissionBroker;
+use super::prompt::PromptBuilder;
+use super::state::{LoopState, OutboxBuilder};
+
+/// Maximum LLM round-trips before forced termination.
+const MAX_ITERATIONS: u32 = 30;
+
+// ── CancelReason ────────────────────────────────────────────────────────
+
+/// Shared cancellation cause with `set_once` semantics.
+struct CancelReason {
+    reason: Mutex<Option<ErrorKind>>,
+}
+
+impl CancelReason {
+    fn new() -> Self {
+        Self {
+            reason: Mutex::new(None),
+        }
+    }
+
+    /// Record a reason unless one has already been set (set_once).
+    fn set(&self, kind: ErrorKind) {
+        let mut guard = self.reason.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(kind);
+        }
+    }
+
+    /// Return the stored reason (clone required — `ErrorKind` is not `Copy`).
+    fn get(&self) -> ErrorKind {
+        self.reason
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(ErrorKind::Cancelled)
+    }
+}
+
+// ── LifecycleContext ───────────────────────────────────────────────────
+
+/// Opaque lifecycle handle — when `Some`, the agent loop writes state
+/// transitions to the database and runs a heartbeat.
+///
+/// P2.6: only `run_with_lifecycle` supplies this.  Existing `run()` passes
+/// `None` so all existing tests and the [`crate::agent::adapter::AgentRuntime`]
+/// trait remain unaffected.
+pub struct LifecycleContext {
+    pub run_id: String,
+    pub db_path: PathBuf,
+    /// P2.7: dispatch req_id, used by AwaitingPermission → PermissionBroker.
+    pub req_id: String,
+    /// Optional live stream sink used by daemon-owned runs.
+    pub stream_tx: Option<mpsc::Sender<Message>>,
+}
+
+// ── AgentLoop ───────────────────────────────────────────────────────────
+
+/// The built-in Rust agent runtime.
+pub struct AgentLoop {
+    pub(crate) agent_id: String,
+    /// "ask_user" (prompt), "auto" (always approve), or "deny_all" (always reject).
+    pub(crate) permission_mode: String,
+    router: Arc<Router>,
+    model_strategy: ModelStrategy,
+    prompt_builder: PromptBuilder,
+    pub(crate) tool_registry: Arc<ToolRegistry>,
+    allowed_tool_names: Vec<String>,
+    permission_broker: Arc<dyn PermissionBroker>,
+    cancel_token: CancellationToken,
+    cancel_reason: Arc<CancelReason>,
+    messages: Vec<ChatMessage>,
+    pending_tool_calls: Vec<ToolCall>,
+    /// Extracted from TaskCard during BuildingPrompt.
+    must_keep: Vec<String>,
+    denied_commands: Vec<String>,
+    /// Working directory — defaults to current dir.  Public for tests.
+    pub work_dir: std::path::PathBuf,
+    /// P3.4: retry feedback set by daemon before a retry attempt.
+    /// Consumed once in [`LoopState::BuildingPrompt`], after system prompt push.
+    pending_retry_feedback: Option<String>,
+}
+
+impl AgentLoop {
+    /// P5+.7: expose accumulated conversation messages (read-only, for test assertions).
+    pub fn messages(&self) -> &[ChatMessage] {
+        &self.messages
+    }
+
+    /// Build an AgentLoop with pre-built components (test / internal use).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_components(
+        agent_id: String,
+        permission_mode: String,
+        router: Arc<Router>,
+        model_strategy: ModelStrategy,
+        prompt_builder: PromptBuilder,
+        tool_registry: Arc<ToolRegistry>,
+        permission_broker: Arc<dyn PermissionBroker>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self {
+            agent_id,
+            permission_mode,
+            router,
+            model_strategy,
+            prompt_builder,
+            tool_registry,
+            allowed_tool_names: Vec::new(),
+            permission_broker,
+            cancel_token,
+            cancel_reason: Arc::new(CancelReason::new()),
+            messages: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            must_keep: vec![],
+            denied_commands: vec![],
+            work_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            pending_retry_feedback: None,
+        }
+    }
+
+    /// Build a ready-to-run loop from config files.
+    ///
+    /// Reads `models.yaml` and `managed-agents.yaml`, constructs a
+    /// [`Router`], and wires all dependencies.
+    pub fn new(
+        agent_id: String,
+        config: crate::config::DaedalusConfig,
+        tool_registry: Arc<ToolRegistry>,
+        permission_broker: Arc<dyn PermissionBroker>,
+        cancel_token: CancellationToken,
+    ) -> Result<Self, crate::error::DaedalusError> {
+        let prompt_builder = PromptBuilder::new(config.clone());
+        let agent_config = prompt_builder.load_agent_section(&agent_id)?;
+        let models = crate::config::load_models_yaml(&config.models_yaml_path)?;
+        let model_strategy = agent_config.model_strategy.clone();
+        let router = Arc::new(Router::from_models_config(&models, &model_strategy)?);
+
+        Ok(Self {
+            agent_id,
+            permission_mode: agent_config.permission.clone(),
+            router,
+            model_strategy,
+            prompt_builder,
+            tool_registry,
+            allowed_tool_names: agent_config.tools,
+            permission_broker,
+            cancel_token,
+            cancel_reason: Arc::new(CancelReason::new()),
+            messages: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            must_keep: vec![],
+            denied_commands: vec![],
+            work_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            pending_retry_feedback: None,
+        })
+    }
+
+    // ── public API ──────────────────────────────────────────────────
+
+    /// P3.4: set retry feedback for the next run.
+    /// Called by daemon AFTER factory.build() and BEFORE run_with_lifecycle().
+    /// Consumed once in [`LoopState::BuildingPrompt`], after system prompt.
+    pub fn set_retry_feedback(&mut self, detail: &str) {
+        self.pending_retry_feedback = Some(format!(
+            "Previous attempt failed: {detail}\n\
+             Please analyse the failure and try a different approach."
+        ));
+    }
+
+    /// Execute a task **without** lifecycle tracking (P2.4 original API).
+    ///
+    /// Delegates to [`run_inner`] with `lifecycle = None`.
+    /// Backward-compatible — all existing P2.4/P2.5 tests use this.
+    pub async fn run(&mut self, task: TaskCard, timeout: Duration) -> Result<Outbox, AgentError> {
+        self.run_inner(None, task, timeout).await
+    }
+
+    /// Execute a task **with** lifecycle tracking (P2.6).
+    ///
+    /// Immediately transitions the database row from `queued` → `running`,
+    /// starts a [`HeartbeatLoop`], then enters the state machine.  Terminal
+    /// states (`Done` / `Failed`) write the corresponding transition to the
+    /// database.
+    ///
+    /// The caller (P2.7 `control.rs`) is responsible for inserting the
+    /// initial `queued` row before calling this method.
+    pub async fn run_with_lifecycle(
+        &mut self,
+        lc: LifecycleContext,
+        task: TaskCard,
+        timeout: Duration,
+    ) -> Result<Outbox, AgentError> {
+        // ── entry: queued → running + start heartbeat ──
+        {
+            let db_path = lc.db_path.clone();
+            let run_id = lc.run_id.clone();
+            let now = now_secs();
+            let rows = tokio::task::spawn_blocking(move || {
+                let conn = crate::db::pool::open(&db_path).map_err(|e| AgentError {
+                    reason: ErrorKind::ToolFailure,
+                    detail: format!("lifecycle db open: {e}"),
+                    provider_error: None,
+                })?;
+                crate::db::registry::transition_to_running(&conn, &run_id, now).map_err(|e| {
+                    AgentError {
+                        reason: ErrorKind::ToolFailure,
+                        detail: format!("lifecycle transition_to_running: {e}"),
+                        provider_error: None,
+                    }
+                })
+            })
+            .await
+            .map_err(|_| AgentError {
+                reason: ErrorKind::ToolFailure,
+                detail: "lifecycle spawn_blocking panic".into(),
+                provider_error: None,
+            })??;
+
+            if rows == 0 {
+                return Err(AgentError {
+                    reason: ErrorKind::ToolFailure,
+                    detail: format!(
+                        "transition_to_running affected 0 rows — run {} not in queued state",
+                        lc.run_id
+                    ),
+                    provider_error: None,
+                });
+            }
+        }
+
+        let hb = HeartbeatLoop::new(
+            lc.run_id.clone(),
+            lc.db_path.clone(),
+            self.cancel_token.clone(),
+        );
+        let hb_handle = hb.start();
+
+        self.run_inner(Some((lc, hb_handle)), task, timeout).await
+    }
+
+    /// Core state machine shared by [`run`] and [`run_with_lifecycle`].
+    ///
+    /// `lifecycle` is `None` for bare execution and `Some((ctx, hb_handle))`
+    /// for DB-tracked execution.  On terminal states the heartbeat handle is
+    /// aborted and the final DB transition is written.
+    async fn run_inner(
+        &mut self,
+        mut lifecycle: Option<(LifecycleContext, JoinHandle<()>)>,
+        task: TaskCard,
+        timeout: Duration,
+    ) -> Result<Outbox, AgentError> {
+        let task_id = task.task_card_id.clone();
+        let agent_id = self.agent_id.clone();
+
+        // Spawn deadline task — only sets reason + fires token.
+        let cr = Arc::clone(&self.cancel_reason);
+        let ct = self.cancel_token.clone();
+        let _deadline = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            cr.set(ErrorKind::TaskTimeout);
+            ct.cancel();
+        });
+
+        let mut state = LoopState::BuildingPrompt {
+            agent_id: agent_id.clone(),
+            task: Box::new(task),
+        };
+        let mut iteration: u32 = 0;
+
+        loop {
+            state = match state {
+                // ── BuildingPrompt ──────────────────────────────────
+                LoopState::BuildingPrompt { agent_id, task } => {
+                    let task = *task;
+                    // Extract safety rules from the task card.
+                    self.denied_commands = task.safety.denied_commands.clone();
+                    self.must_keep = task
+                        .compiled_intent
+                        .get("must_keep")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match self.prompt_builder.build_system_prompt(&agent_id, &task) {
+                        Ok(system) => {
+                            self.messages.push(ChatMessage {
+                                role: "system".into(),
+                                content: system,
+                                tool_call_id: None,
+                                tool_calls: vec![],
+                            });
+                            // P3.4: inject retry feedback AFTER system prompt.
+                            if let Some(feedback) = self.pending_retry_feedback.take() {
+                                self.messages.push(ChatMessage {
+                                    role: "system".into(),
+                                    content: feedback,
+                                    tool_call_id: None,
+                                    tool_calls: vec![],
+                                });
+                            }
+                            self.messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: format!(
+                                    "当前任务:\n目标: {}\n编译意图: {}\n\n完成后调用 task_done，summary 必须直接回应目标。",
+                                    task.goal,
+                                    serde_json::to_string(&task.compiled_intent)
+                                        .unwrap_or_default()
+                                ),
+                                tool_call_id: None,
+                                tool_calls: vec![],
+                            });
+                            LoopState::SendingToLLM {
+                                messages: self.messages.clone(),
+                                tools: self.tool_definitions(),
+                            }
+                        }
+                        Err(e) => LoopState::Failed {
+                            reason: ErrorKind::ToolFailure,
+                            detail: format!("prompt: {e}"),
+                            provider_error: None,
+                        },
+                    }
+                }
+
+                // ── SendingToLLM ────────────────────────────────────
+                LoopState::SendingToLLM { messages, tools } => {
+                    iteration += 1;
+                    if iteration > MAX_ITERATIONS {
+                        LoopState::Failed {
+                            reason: ErrorKind::MaxIterations,
+                            detail: format!("exceeded {MAX_ITERATIONS} LLM round-trips"),
+                            provider_error: None,
+                        }
+                    } else {
+                        match self.stream_with_cancel(&messages, &tools).await {
+                            Ok(stream) => LoopState::ReceivingStream {
+                                stream,
+                                assistant_text: String::new(),
+                                tool_calls: Vec::new(),
+                            },
+                            Err(e) => LoopState::Failed {
+                                reason: e.reason,
+                                detail: e.detail,
+                                provider_error: e.provider_error,
+                            },
+                        }
+                    }
+                }
+
+                // ── ReceivingStream ─────────────────────────────────
+                LoopState::ReceivingStream {
+                    mut stream,
+                    mut assistant_text,
+                    mut tool_calls,
+                } => {
+                    match self.next_chunk_with_cancel(&mut stream).await {
+                        Err(agent_error) => {
+                            // P5+.7: stream error — do not save incomplete tool_calls.
+                            self.messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: assistant_text,
+                                tool_call_id: None,
+                                tool_calls: vec![],
+                            });
+                            LoopState::Failed {
+                                reason: agent_error.reason,
+                                detail: agent_error.detail,
+                                provider_error: agent_error.provider_error,
+                            }
+                        }
+                        Ok(None) => {
+                            // Stream ended.  Push assistant message with
+                            // tool_calls (P5+.7), then process pending tools.
+                            let saved = tool_calls.clone();
+                            self.messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: assistant_text.clone(),
+                                tool_call_id: None,
+                                tool_calls: saved,
+                            });
+                            if tool_calls.is_empty() {
+                                LoopState::BuildingResponse {
+                                    builder: OutboxBuilder::new(task_id.clone(), agent_id.clone()),
+                                    summary: assistant_text,
+                                }
+                            } else {
+                                self.pending_tool_calls = tool_calls;
+                                let tc = self.pending_tool_calls.remove(0);
+                                LoopState::ExecutingTool { tool_call: tc }
+                            }
+                        }
+                        Ok(Some(StreamChunk::Text { content })) => {
+                            self.emit_task_stream(&lifecycle, &task_id, &content).await;
+                            assistant_text.push_str(&content);
+                            LoopState::ReceivingStream {
+                                stream,
+                                assistant_text,
+                                tool_calls,
+                            }
+                        }
+                        Ok(Some(StreamChunk::ToolCall { id, name, input })) => {
+                            tool_calls.push(ToolCall { id, name, input });
+                            LoopState::ReceivingStream {
+                                stream,
+                                assistant_text,
+                                tool_calls,
+                            }
+                        }
+                        Ok(Some(StreamChunk::Done)) => {
+                            // Treat explicit Done the same as stream EOF.
+                            // P5+.7: clone tool_calls before checking empty.
+                            let saved = tool_calls.clone();
+                            self.messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: std::mem::take(&mut assistant_text),
+                                tool_call_id: None,
+                                tool_calls: saved,
+                            });
+                            if tool_calls.is_empty() {
+                                LoopState::BuildingResponse {
+                                    builder: OutboxBuilder::new(task_id.clone(), agent_id.clone()),
+                                    summary: self
+                                        .messages
+                                        .iter()
+                                        .filter(|m| m.role == "assistant")
+                                        .map(|m| m.content.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                }
+                            } else {
+                                self.pending_tool_calls = tool_calls;
+                                let tc = self.pending_tool_calls.remove(0);
+                                LoopState::ExecutingTool { tool_call: tc }
+                            }
+                        }
+                    }
+                }
+
+                // ── ExecutingTool ───────────────────────────────────
+                LoopState::ExecutingTool { tool_call } => {
+                    match self.check_tool_access(&tool_call) {
+                        Ok(tool) => {
+                            // Step 3: permission check.
+                            let needs_perm = tool.needs_permission(&tool_call.input);
+                            if needs_perm && self.permission_mode.as_str() == "deny_all" {
+                                if tool_call.name == "task_done"
+                                    && !self.pending_tool_calls.is_empty()
+                                {
+                                    self.pending_tool_calls.clear();
+                                }
+                                self.messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: "denied: permission mode is deny_all".into(),
+                                    tool_call_id: Some(tool_call.id.clone()),
+                                    tool_calls: vec![],
+                                });
+                                if !self.pending_tool_calls.is_empty() {
+                                    let next = self.pending_tool_calls.remove(0);
+                                    LoopState::ExecutingTool { tool_call: next }
+                                } else {
+                                    LoopState::SendingToLLM {
+                                        messages: self.messages.clone(),
+                                        tools: self.tool_definitions(),
+                                    }
+                                }
+                            } else if needs_perm && self.permission_mode.as_str() != "auto" {
+                                LoopState::AwaitingPermission {
+                                    tool_call,
+                                    requested_at: Instant::now(),
+                                }
+                            } else {
+                                let result =
+                                    self.execute_with_cancel(tool.as_ref(), &tool_call).await;
+
+                                match result {
+                                    Ok(tool_result) => {
+                                        self.messages.push(ChatMessage {
+                                            role: "tool".into(),
+                                            content: tool_result.output.clone(),
+                                            tool_call_id: Some(tool_call.id.clone()),
+                                            tool_calls: vec![],
+                                        });
+                                        self.emit_narrative_speak(
+                                            &lifecycle,
+                                            &task_id,
+                                            &tool_call.name,
+                                            &tool_result,
+                                        )
+                                        .await;
+
+                                        if tool_call.name == "task_done" && !tool_result.is_error {
+                                            self.pending_tool_calls.clear();
+                                            LoopState::BuildingResponse {
+                                                builder: OutboxBuilder::new(
+                                                    task_id.clone(),
+                                                    agent_id.clone(),
+                                                ),
+                                                summary: task_done_summary(&tool_result.output),
+                                            }
+                                        } else if !self.pending_tool_calls.is_empty() {
+                                            let next = self.pending_tool_calls.remove(0);
+                                            LoopState::ExecutingTool { tool_call: next }
+                                        } else {
+                                            LoopState::SendingToLLM {
+                                                messages: self.messages.clone(),
+                                                tools: self.tool_definitions(),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => LoopState::Failed {
+                                        reason: e.reason,
+                                        detail: e.detail,
+                                        provider_error: None,
+                                    },
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.messages.push(ChatMessage {
+                                role: "tool".into(),
+                                content: format!("error: {e}"),
+                                tool_call_id: Some(tool_call.id.clone()),
+                                tool_calls: vec![],
+                            });
+                            LoopState::Failed {
+                                reason: e.reason,
+                                detail: e.detail,
+                                provider_error: None,
+                            }
+                        }
+                    }
+                }
+
+                // ── AwaitingPermission ──────────────────────────────
+                LoopState::AwaitingPermission {
+                    tool_call,
+                    requested_at: _,
+                } => {
+                    let token = self.cancel_token.clone();
+                    let cr = Arc::clone(&self.cancel_reason);
+                    // P2.7: use lc.req_id when lifecycle is active; empty string
+                    // for old tests that use FakePermissionBroker.
+                    let req_id: &str = lifecycle
+                        .as_ref()
+                        .map(|(lc, _)| lc.req_id.as_str())
+                        .unwrap_or("");
+                    select! {
+                        decision = self.permission_broker
+                            .request_permission(&self.agent_id, req_id, &tool_call, &task_id) => {
+                            match decision {
+                                Ok(PermissionDecision::Approved) => {
+                                    // Execute directly to avoid re-entering
+                                    // ExecutingTool which would check
+                                    // needs_permission again.
+                                    match self.check_tool_access(&tool_call) {
+                                        Ok(tool) => {
+                                            let result = self
+                                                .execute_with_cancel(tool.as_ref(), &tool_call)
+                                                .await;
+                                            match result {
+                                                Ok(tool_result) => {
+                                                    self.messages.push(ChatMessage {
+                                                        role: "tool".into(),
+                                                        content: tool_result.output.clone(),
+                                                        tool_call_id: Some(tool_call.id.clone()),
+                                                        tool_calls: vec![],
+                                                    });
+                                                    self.emit_narrative_speak(
+                                                        &lifecycle,
+                                                        &task_id,
+                                                        &tool_call.name,
+                                                        &tool_result,
+                                                    )
+                                                    .await;
+                                                    if tool_call.name == "task_done"
+                                                        && !tool_result.is_error
+                                                    {
+                                                        self.pending_tool_calls.clear();
+                                                        LoopState::BuildingResponse {
+                                                            builder: OutboxBuilder::new(
+                                                                task_id.clone(),
+                                                                agent_id.clone(),
+                                                            ),
+                                                            summary: task_done_summary(
+                                                                &tool_result.output,
+                                                            ),
+                                                        }
+                                                    } else if !self.pending_tool_calls.is_empty() {
+                                                        let next = self.pending_tool_calls.remove(0);
+                                                        LoopState::ExecutingTool { tool_call: next }
+                                                    } else {
+                                                        LoopState::SendingToLLM {
+                                                            messages: self.messages.clone(),
+                                                            tools: self.tool_definitions(),
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => LoopState::Failed {
+                                                    reason: e.reason,
+                                                    detail: e.detail,
+                                                    provider_error: None,
+                                                },
+                                            }
+                                        }
+                                        Err(e) => {
+                                            self.messages.push(ChatMessage {
+                                                role: "tool".into(),
+                                                content: format!("error: {e}"),
+                                                tool_call_id: Some(tool_call.id.clone()),
+                                                tool_calls: vec![],
+                                            });
+                                            LoopState::Failed {
+                                                reason: e.reason,
+                                                detail: e.detail,
+                                                provider_error: None,
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(PermissionDecision::Denied) | Err(_) => {
+                                    self.messages.push(ChatMessage {
+                                        role: "tool".into(),
+                                        content: "denied".into(),
+                                        tool_call_id: Some(tool_call.id.clone()),
+                                        tool_calls: vec![],
+                                    });
+                                    // P5+.7: process remaining pending tool calls
+                                    // from the same batch so every assistant
+                                    // tool_call has a matching tool result.
+                                    if !self.pending_tool_calls.is_empty() {
+                                        let next = self.pending_tool_calls.remove(0);
+                                        LoopState::ExecutingTool { tool_call: next }
+                                    } else {
+                                        LoopState::SendingToLLM {
+                                            messages: self.messages.clone(),
+                                            tools: self.tool_definitions(),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ = token.cancelled() => {
+                            LoopState::Failed {
+                                reason: cr.get(),
+                                detail: "permission interrupted".into(),
+                                provider_error: None,
+                            }
+                        }
+                    }
+                }
+
+                // ── BuildingResponse ────────────────────────────────
+                LoopState::BuildingResponse { builder, summary } => {
+                    let outbox = builder.build(summary);
+                    LoopState::Done {
+                        outbox: Box::new(outbox),
+                    }
+                }
+
+                // ── terminal states ─────────────────────────────────
+                LoopState::Done { outbox } => {
+                    // ── lifecycle: stop heartbeat + write done ──
+                    if let Some((lc, hb)) = lifecycle.take() {
+                        hb.abort();
+                        let db_path = lc.db_path.clone();
+                        let run_id = lc.run_id.clone();
+                        let outbox_json =
+                            serde_json::to_string(&*outbox).unwrap_or_else(|_| "{}".into());
+                        let now = now_secs();
+                        let rid = run_id.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let conn = match crate::db::pool::open(&db_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: done db open failed for {}: {e}",
+                                        rid
+                                    );
+                                    return;
+                                }
+                            };
+                            match crate::db::registry::transition_to_done(
+                                &conn, &rid, now, &outbox_json,
+                            ) {
+                                Ok(0) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: done transition affected 0 rows for {} \
+                                         (run may have been orphaned or already terminal)",
+                                        rid
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: done transition error for {}: {e}",
+                                        rid
+                                    );
+                                }
+                                Ok(_) => {}
+                            }
+                        })
+                        .await;
+                        if let Err(e) = result {
+                            eprintln!(
+                                "daedalusd lifecycle: done spawn_blocking join error for {}: {e}",
+                                run_id
+                            );
+                        }
+                    }
+                    return Ok(*outbox);
+                }
+                LoopState::Failed {
+                    reason,
+                    detail,
+                    provider_error,
+                } => {
+                    // ── lifecycle: stop heartbeat + write error/cancelled ──
+                    if let Some((lc, hb)) = lifecycle.take() {
+                        hb.abort();
+                        let db_path = lc.db_path.clone();
+                        let run_id = lc.run_id.clone();
+                        // P3.5: use AgentError::error_code() as single source of truth
+                        // so DB taxonomy matches TaskError taxonomy.
+                        let taxonomy = AgentError {
+                            reason: reason.clone(),
+                            detail: detail.clone(),
+                            provider_error: provider_error.clone(),
+                        }
+                        .error_code()
+                        .as_str()
+                        .to_string();
+                        let is_cancelled = reason == ErrorKind::Cancelled;
+                        let now = now_secs();
+                        let rid = run_id.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let conn = match crate::db::pool::open(&db_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: failed db open error for {}: {e}",
+                                        rid
+                                    );
+                                    return;
+                                }
+                            };
+                            let transition_result = if is_cancelled {
+                                crate::db::registry::transition_to_cancelled(&conn, &rid, now)
+                            } else {
+                                crate::db::registry::transition_to_error(
+                                    &conn, &rid, now, &taxonomy,
+                                )
+                            };
+                            match transition_result {
+                                Ok(0) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: failed transition affected 0 rows for {} \
+                                         (run may have been orphaned or already terminal)",
+                                        rid
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "daedalusd lifecycle: failed transition error for {}: {e}",
+                                        rid
+                                    );
+                                }
+                                Ok(_) => {}
+                            }
+                        })
+                        .await;
+                        if let Err(e) = result {
+                            eprintln!(
+                                "daedalusd lifecycle: failed spawn_blocking join error for {}: {e}",
+                                run_id
+                            );
+                        }
+                    }
+                    return Err(AgentError {
+                        reason,
+                        detail,
+                        provider_error,
+                    });
+                }
+                LoopState::Idle => unreachable!(),
+            };
+        }
+    }
+
+    /// Cancel the running task.
+    pub async fn cancel(&self, _task_id: &str) {
+        self.cancel_reason.set(ErrorKind::Cancelled);
+        self.cancel_token.cancel();
+    }
+
+    // ── cancel-aware I/O ───────────────────────────────────────────
+
+    async fn stream_with_cancel(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<StreamHandle, AgentError> {
+        let router = Arc::clone(&self.router);
+        let strategy = self.model_strategy.clone();
+        let msgs = messages.to_vec();
+        let tls = tools.to_vec();
+        let token = self.cancel_token.clone();
+        let cr = Arc::clone(&self.cancel_reason);
+
+        select! {
+            result = async {
+                router.stream_with_fallback(&strategy, &msgs, &tls).await
+            } => {
+                result.map_err(|e| {
+                    let reason = if e.is_fallbackable() {
+                        ErrorKind::ProviderExhausted
+                    } else {
+                        ErrorKind::ProviderFatal
+                    };
+                    AgentError {
+                        reason,
+                        detail: format!("{e}"),
+                        provider_error: Some(e),
+                    }
+                })
+            }
+            _ = token.cancelled() => {
+                let reason = cr.get();
+                let detail = match reason {
+                    ErrorKind::TaskTimeout => "task timed out".into(),
+                    ErrorKind::Cancelled => "task cancelled".into(),
+                    _ => "task interrupted".into(),
+                };
+                Err(AgentError {
+                    reason,
+                    detail,
+                    provider_error: None,
+                })
+            }
+        }
+    }
+
+    async fn next_chunk_with_cancel(
+        &self,
+        stream: &mut StreamHandle,
+    ) -> Result<Option<StreamChunk>, AgentError> {
+        let token = self.cancel_token.clone();
+        let cr = Arc::clone(&self.cancel_reason);
+        select! {
+            chunk = stream.next() => {
+                Ok(chunk.transpose().map_err(|e| {
+                    let reason = if e.is_fallbackable() {
+                        ErrorKind::ProviderExhausted
+                    } else {
+                        ErrorKind::ProviderFatal
+                    };
+                    AgentError {
+                        reason,
+                        detail: format!("{e}"),
+                        provider_error: Some(e),
+                    }
+                })?)
+            }
+            _ = token.cancelled() => {
+                let reason = cr.get();
+                let detail = match reason {
+                    ErrorKind::TaskTimeout => "task timed out".into(),
+                    ErrorKind::Cancelled => "task cancelled".into(),
+                    _ => "task interrupted".into(),
+                };
+                Err(AgentError {
+                    reason,
+                    detail,
+                    provider_error: None,
+                })
+            }
+        }
+    }
+
+    async fn emit_task_stream(
+        &self,
+        lifecycle: &Option<(LifecycleContext, JoinHandle<()>)>,
+        task_id: &str,
+        chunk: &str,
+    ) {
+        if chunk.is_empty() {
+            return;
+        }
+        let Some((lc, _)) = lifecycle.as_ref() else {
+            return;
+        };
+        let Some(stream_tx) = &lc.stream_tx else {
+            return;
+        };
+
+        let _ = stream_tx
+            .send(Message::TaskStream(TaskStream {
+                ts: crate::ipc::protocol::now_utc(),
+                event_id: None,
+                req_id: lc.req_id.clone(),
+                agent_id: self.agent_id.clone(),
+                task_id: task_id.to_string(),
+                chunk: chunk.to_string(),
+            }))
+            .await;
+    }
+
+    async fn emit_narrative_speak(
+        &self,
+        lifecycle: &Option<(LifecycleContext, JoinHandle<()>)>,
+        task_id: &str,
+        tool_name: &str,
+        tool_result: &ToolResult,
+    ) {
+        if tool_name != "speak" || tool_result.is_error {
+            return;
+        }
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(&tool_result.output) else {
+            return;
+        };
+        if output.get("event_type").and_then(|value| value.as_str()) != Some("utterance_complete") {
+            return;
+        }
+        let Some(text) = output
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let Some(emotion) = output
+            .get("emotion")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        let Some((lc, _)) = lifecycle.as_ref() else {
+            return;
+        };
+        let Some(stream_tx) = &lc.stream_tx else {
+            return;
+        };
+
+        let _ = stream_tx
+            .send(Message::NarrativeSpeak(NarrativeSpeak {
+                ts: crate::ipc::protocol::now_utc(),
+                event_id: None,
+                req_id: lc.req_id.clone(),
+                agent_id: self.agent_id.clone(),
+                task_id: task_id.to_string(),
+                text: text.to_string(),
+                emotion: emotion.to_string(),
+            }))
+            .await;
+    }
+
+    async fn execute_with_cancel(
+        &self,
+        tool: &dyn crate::tools::Tool,
+        tc: &ToolCall,
+    ) -> Result<ToolResult, AgentError> {
+        let ctx = crate::tools::ToolContext {
+            agent_id: self.agent_id.clone(),
+            work_dir: self.work_dir.clone(),
+            must_keep: self.must_keep.clone(),
+            denied_commands: self.denied_commands.clone(),
+        };
+        let input = tc.input.clone();
+        let token = self.cancel_token.clone();
+        let cr = Arc::clone(&self.cancel_reason);
+
+        select! {
+            result = tool.execute(input, &ctx) => {
+                result.map_err(|e| AgentError {
+                    reason: ErrorKind::ToolFailure,
+                    detail: format!("{e}"),
+                    provider_error: None,
+                })
+            }
+            _ = token.cancelled() => {
+                Err(AgentError {
+                    reason: cr.get(),
+                    detail: "tool execution interrupted".into(),
+                    provider_error: None,
+                })
+            }
+        }
+    }
+
+    // ── tool access check ──────────────────────────────────────────
+
+    fn check_tool_access(
+        &self,
+        tc: &ToolCall,
+    ) -> Result<std::sync::Arc<dyn crate::tools::Tool>, AgentError> {
+        if !self.allowed_tool_names.is_empty()
+            && !self.allowed_tool_names.iter().any(|name| name == &tc.name)
+        {
+            return Err(AgentError {
+                reason: ErrorKind::ToolFailure,
+                detail: format!(
+                    "agent '{}' is not allowed to use tool '{}'",
+                    self.agent_id, tc.name
+                ),
+                provider_error: None,
+            });
+        }
+
+        let tool = self.tool_registry.get(&tc.name).ok_or_else(|| AgentError {
+            reason: ErrorKind::ToolFailure,
+            detail: format!("unknown tool: {}", tc.name),
+            provider_error: None,
+        })?;
+
+        let allowed = tool.allowed_agents();
+        if !allowed.contains(&"*".to_string()) && !allowed.contains(&self.agent_id) {
+            return Err(AgentError {
+                reason: ErrorKind::ToolFailure,
+                detail: format!(
+                    "agent '{}' is not allowed to use tool '{}'",
+                    self.agent_id, tc.name
+                ),
+                provider_error: None,
+            });
+        }
+
+        Ok(std::sync::Arc::clone(tool))
+    }
+
+    fn tool_definitions(&self) -> Vec<ToolDef> {
+        let definitions = self.tool_registry.definitions();
+        if self.allowed_tool_names.is_empty() {
+            return definitions;
+        }
+        definitions
+            .into_iter()
+            .filter(|tool| {
+                self.allowed_tool_names
+                    .iter()
+                    .any(|name| name == &tool.name)
+            })
+            .collect()
+    }
+}
+
+// ── helpers ─────────────────────────────────────────────────────────
+
+/// Current Unix timestamp in seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn task_done_summary(output: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(output)
+        .ok()
+        .and_then(|v| {
+            v.get("summary")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| output.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_done_summary;
+
+    #[test]
+    fn task_done_summary_extracts_json_summary() {
+        assert_eq!(task_done_summary(r#"{"summary":"OK"}"#), "OK");
+    }
+
+    #[test]
+    fn task_done_summary_keeps_plain_text() {
+        assert_eq!(task_done_summary("OK"), "OK");
+    }
+}

@@ -1,0 +1,2 @@
+[console_scripts]
+daedalus = daedalus.orch.cli:main

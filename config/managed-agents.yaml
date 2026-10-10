@@ -1,0 +1,31 @@
+agents:
+  # 跑腿三档，我按任务派
+  trivial-worker:
+    role_summary: 干杂活：改格式、重命名、跑测试、简单文件操作。快而便宜。
+    tools: [file_read, file_write, terminal, task_done]
+    permission: auto
+    model_strategy:
+      primary:
+        model: longcat-free
+        max_tokens: 2048
+        temperature: 0.3
+
+  code-worker:
+    role_summary: 写代码：实现功能、修 bug、重构。需要代码能力。
+    tools: [file_read, file_write, terminal, task_done]
+    permission: auto
+    model_strategy:
+      primary:
+        model: deepseek-v4-flash
+        max_tokens: 4096
+        temperature: 0.5
+
+  think-worker:
+    role_summary: 动脑子：设计方案、review 代码、分析问题。需要推理能力。
+    tools: [file_read, file_write, terminal, task_done]
+    permission: auto
+    model_strategy:
+      primary:
+        model: deepseek-v4-pro
+        max_tokens: 8192
+        temperature: 0.7

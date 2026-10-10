@@ -1,0 +1,22 @@
+providers:
+  opencode_go:
+    type: openai_compat
+    api_key_env: OPENCODE_GO_DUMMY
+
+models:
+  - id: longcat-free
+    provider: opencode_go
+    base_url: http://127.0.0.1:8899/v1
+    api_key_env: OPENCODE_GO_DUMMY
+    model_id: longcat-2.5-preview-free
+
+  - id: deepseek-v4-flash
+    provider: opencode_go
+    base_url: http://127.0.0.1:8899/v1
+    api_key_env: OPENCODE_GO_DUMMY
+    model_id: deepseek-v4-flash
+  - id: deepseek-v4-pro
+    provider: opencode_go
+    base_url: http://127.0.0.1:8899/v1
+    api_key_env: OPENCODE_GO_DUMMY
+    model_id: deepseek-v4-pro
