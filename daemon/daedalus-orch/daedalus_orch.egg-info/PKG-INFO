@@ -1,5 +1,0 @@
-Metadata-Version: 2.4
-Name: daedalus-orch
-Version: 0.1.0
-Summary: Daedalus orchestration layer — Python CLI and UDS client
-Requires-Python: >=3.11
