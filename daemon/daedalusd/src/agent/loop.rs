@@ -31,6 +31,31 @@ use super::state::{LoopState, OutboxBuilder};
 /// Maximum LLM round-trips before forced termination.
 const MAX_ITERATIONS: u32 = 30;
 
+/// Retry an exhausted fallback chain before reporting ProviderExhausted.
+/// The caller keeps this entire future inside its cancellation select.
+async fn retry_exhausted_provider<T, F, Fut>(mut call: F) -> Result<T, crate::error::ProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::error::ProviderError>>,
+{
+    let mut retries = 0;
+    loop {
+        match call().await {
+            Err(error) if error.is_fallbackable() && retries < 3 => {
+                let delay = Duration::from_secs(5 * (1 << retries));
+                eprintln!(
+                    "daedalusd: provider exhausted; retry {} in {}s",
+                    retries + 1,
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+                retries += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 // ── CancelReason ────────────────────────────────────────────────────────
 
 /// Shared cancellation cause with `set_once` semantics.
@@ -837,7 +862,7 @@ impl AgentLoop {
 
         select! {
             result = async {
-                router.stream_with_fallback(&strategy, &msgs, &tls).await
+                retry_exhausted_provider(|| router.stream_with_fallback(&strategy, &msgs, &tls)).await
             } => {
                 result.map_err(|e| {
                     let reason = if e.is_fallbackable() {
@@ -1097,6 +1122,78 @@ fn task_done_summary(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::task_done_summary;
+
+    #[tokio::test]
+    async fn provider_exhausted_retries_with_exponential_backoff() {
+        let mut attempts = 0;
+        let start = tokio::time::Instant::now();
+        let result = super::retry_exhausted_provider(|| {
+            attempts += 1;
+            std::future::ready(if attempts < 4 {
+                Err(crate::error::ProviderError::RateLimited {
+                    status: 429,
+                    body: "limited".into(),
+                })
+            } else {
+                Ok("recovered")
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(attempts, 4);
+        assert!(start.elapsed() >= std::time::Duration::from_secs(35));
+    }
+
+    #[tokio::test]
+    async fn provider_exhausted_stops_after_three_retries() {
+        let mut attempts = 0;
+        let result: Result<(), _> = super::retry_exhausted_provider(|| {
+            attempts += 1;
+            std::future::ready(Err(crate::error::ProviderError::RateLimited {
+                status: 429,
+                body: "limited".into(),
+            }))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_provider_backoff() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        let mut attempts = 0;
+        tokio::select! {
+            result = super::retry_exhausted_provider(|| {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(crate::error::ProviderError::RateLimited {
+                    status: 429, body: "limited".into()
+                }))
+            }) => panic!("backoff should be cancelled: {result:?}"),
+            _ = token.cancelled() => {}
+        }
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_fatal_is_not_retried() {
+        let mut attempts = 0;
+        let result: Result<(), _> = super::retry_exhausted_provider(|| {
+            attempts += 1;
+            std::future::ready(Err(crate::error::ProviderError::Auth {
+                status: 401,
+                body: "invalid".into(),
+            }))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
 
     #[test]
     fn task_done_summary_extracts_json_summary() {

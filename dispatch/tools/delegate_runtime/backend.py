@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 import json
 import os
 import socket
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Protocol
 from urllib import error as urllib_error
@@ -167,38 +168,73 @@ class DaedalusBackend:
         opener: Any = None,
         max_retries: int = 3,
         retry_delay: float = 1.0,
+        max_concurrent: int = 2,
     ) -> None:
         self.base_url = (base_url or os.environ.get("HERMES_DAEDALUS_URL") or "http://127.0.0.1:7878").rstrip("/")
         self.timeout = timeout
         self._opener = opener or urllib_request
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be at least 1")
+        self._task_slots = threading.Semaphore(max_concurrent)
+        self._active_tasks: set[str] = set()
+        self._active_lock = threading.Lock()
 
     @property
     def dispatches_remotely(self) -> bool:
         return True
 
     def dispatch(self, spec: TaskSpec) -> str:
-        ensure_daedalus_alive(base_url=self.base_url)
-        data = self._request("POST", "/api/tasks", asdict(spec))
-        run_id = data.get("run_id") or data.get("task_id") or data.get("id")
-        if not run_id:
-            raise BackendError("Daedalus dispatch response did not include run_id")
-        return str(run_id)
+        # POST only starts the remote run: hold its slot until it is terminal.
+        while not self._task_slots.acquire(timeout=0.5):
+            with self._active_lock:
+                active = list(self._active_tasks)
+            for task_id in active:
+                try:
+                    self.get_status(task_id)
+                except (urllib_error.URLError, TimeoutError, ConnectionError, socket.timeout):
+                    # A failed status read does not mean the remote task stopped.
+                    continue
+        try:
+            ensure_daedalus_alive(base_url=self.base_url)
+            data = self._request("POST", "/api/tasks", asdict(spec))
+            run_id = data.get("run_id") or data.get("task_id") or data.get("id")
+            if not run_id:
+                raise BackendError("Daedalus dispatch response did not include run_id")
+            run_id = str(run_id)
+            with self._active_lock:
+                self._active_tasks.add(run_id)
+            return run_id
+        except BaseException:
+            self._task_slots.release()
+            raise
+
+    def _release_finished_task(self, task_id: str) -> None:
+        with self._active_lock:
+            if task_id in self._active_tasks:
+                self._active_tasks.remove(task_id)
+                self._task_slots.release()
 
     def get_status(self, subagent_id: str) -> Optional[SubagentState]:
         data = self._get_task(subagent_id)
         if data is None:
+            self._release_finished_task(subagent_id)
             return None
-        return self._state_from_task(data, subagent_id)
+        state = self._state_from_task(data, subagent_id)
+        if state.status != "running":
+            self._release_finished_task(subagent_id)
+        return state
 
     def get_result(self, subagent_id: str) -> Optional[SubagentResult]:
         data = self._get_task(subagent_id)
         if data is None:
+            self._release_finished_task(subagent_id)
             return None
         status = _map_status(data.get("status") or data.get("state"))
         if status == "running":
             return None
+        self._release_finished_task(subagent_id)
         return SubagentResult(
             subagent_id=str(data.get("run_id") or data.get("task_id") or data.get("id") or subagent_id),
             status=status,
