@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 import os
+import socket
 import time
 from typing import Any, Callable, Dict, List, Optional, Protocol
 from urllib import error as urllib_error
@@ -134,10 +135,14 @@ class DaedalusBackend:
         *,
         timeout: float = 10.0,
         opener: Any = None,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ) -> None:
         self.base_url = (base_url or os.environ.get("HERMES_DAEDALUS_URL") or "http://127.0.0.1:7878").rstrip("/")
         self.timeout = timeout
         self._opener = opener or urllib_request
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
 
     @property
     def dispatches_remotely(self) -> bool:
@@ -201,17 +206,45 @@ class DaedalusBackend:
         payload: Optional[Dict[str, Any]] = None,
     ) -> Any:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
-        req = urllib_request.Request(
-            self.base_url + path,
-            data=body,
-            method=method,
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-        )
-        with self._opener.urlopen(req, timeout=self.timeout) as resp:
-            raw = resp.read()
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
+        attempt = 0
+        while True:
+            try:
+                req = urllib_request.Request(
+                    self.base_url + path,
+                    data=body,
+                    method=method,
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                )
+                with self._opener.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read()
+                if not raw:
+                    return {}
+                return json.loads(raw.decode("utf-8"))
+            except urllib_error.HTTPError as exc:
+                if not self._is_retryable_http_error(exc) or attempt >= self.max_retries:
+                    raise
+            except (urllib_error.URLError, TimeoutError, ConnectionError, socket.timeout) as exc:
+                if not self._is_retryable_network_error(exc) or attempt >= self.max_retries:
+                    raise
+            self._sleep_before_retry(attempt)
+            attempt += 1
+
+    @staticmethod
+    def _is_retryable_http_error(exc: urllib_error.HTTPError) -> bool:
+        return exc.code == 429 or 500 <= exc.code < 600
+
+    @staticmethod
+    def _is_retryable_network_error(exc: BaseException) -> bool:
+        if isinstance(exc, urllib_error.HTTPError):
+            return False
+        if isinstance(exc, (TimeoutError, ConnectionError, socket.timeout)):
+            return True
+        if isinstance(exc, urllib_error.URLError):
+            return isinstance(exc.reason, (TimeoutError, ConnectionError, socket.timeout))
+        return False
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        time.sleep(self.retry_delay * (2 ** attempt))
 
     def _state_from_task(self, data: Dict[str, Any], fallback_id: str) -> SubagentState:
         return SubagentState(
