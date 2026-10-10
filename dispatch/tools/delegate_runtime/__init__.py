@@ -47,6 +47,7 @@ from tools.delegate_runtime.postprocess import (
     sum_child_costs,
 )
 from tools.delegate_runtime.progress import wait_with_progress
+from tools.delegate_runtime.verify import VerifyResult, auto_verify
 
 __all__ = [
     "BackendError",
@@ -86,4 +87,6 @@ __all__ = [
     "strip_child_entry_metadata",
     "sum_child_costs",
     "wait_with_progress",
+    "VerifyResult",
+    "auto_verify",
 ]

@@ -36,6 +36,9 @@ class TestDelegateRuntimePublicApi(unittest.TestCase):
             "strip_child_entry_metadata",
             "sum_child_costs",
             "build_subagent_stop_payload",
+            "wait_with_progress",
+            "auto_verify",
+            "VerifyResult",
         ]
 
         for name in expected:

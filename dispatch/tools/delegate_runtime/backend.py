@@ -27,6 +27,7 @@ class TaskSpec:
     isolation: Optional[str] = None
     max_iterations: Optional[int] = None
     run_in_background: bool = False
+    verify_command: Optional[str] = None
 
 
 @dataclass
