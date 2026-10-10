@@ -122,18 +122,39 @@ pub trait Tool: Send + Sync {
 
 // ── path helpers ─────────────────────────────────────────────────────────
 
+/// Expand `~` and `~/...` using a valid, absolute HOME directory.
+fn expand_tilde(raw: &str) -> Result<PathBuf, String> {
+    if raw != "~" && !raw.starts_with("~/") {
+        return Ok(PathBuf::from(raw));
+    }
+
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| "cannot expand '~': HOME is not set".to_string())?;
+    if home.to_str().is_none() {
+        return Err("cannot expand '~': HOME is not valid UTF-8".to_string());
+    }
+    if home.is_empty() {
+        return Err("cannot expand '~': HOME is empty".to_string());
+    }
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err("cannot expand '~': HOME must be an absolute path".to_string());
+    }
+
+    if raw == "~" {
+        Ok(home)
+    } else {
+        // Keep the suffix relative even when it starts with repeated slashes.
+        Ok(home.join(raw[2..].trim_start_matches('/')))
+    }
+}
+
 /// Canonicalize `work_dir` and join `raw`, then canonicalize the full
 /// path.  If the file does not exist yet, canonicalize its deepest
 /// existing parent instead.  Verify the result is within `work_dir`.
 /// Used by [`file_read`](crate::tools::file_read::FileReadTool).
 pub(crate) fn resolve_read_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf, String> {
-    // 展开 ~ 为 HOME
-    let expanded: String = if raw == "~" || raw.starts_with("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}{}", home, &raw[1..])
-    } else {
-        raw.to_string()
-    };
+    let expanded = expand_tilde(raw)?;
     let cwd =
         std::fs::canonicalize(work_dir).map_err(|e| format!("cannot resolve work_dir: {e}"))?;
     let joined = cwd.join(&expanded);
@@ -173,13 +194,7 @@ pub(crate) fn resolve_read_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf
 /// existing ancestor and checks that instead.  `..` components are
 /// rejected early as an escape attempt.
 pub(crate) fn resolve_write_path(raw: &str, work_dir: &PathBuf) -> Result<PathBuf, String> {
-    // 展开 ~ 为 HOME
-    let expanded: String = if raw == "~" || raw.starts_with("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{}{}", home, &raw[1..])
-    } else {
-        raw.to_string()
-    };
+    let expanded = expand_tilde(raw)?;
     // Reject ParentDir components using Path::components().
     // This catches ".." without false-positives on filenames containing "..".
     let raw_path = std::path::Path::new(&expanded);
