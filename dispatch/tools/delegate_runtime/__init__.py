@@ -46,6 +46,7 @@ from tools.delegate_runtime.postprocess import (
     strip_child_entry_metadata,
     sum_child_costs,
 )
+from tools.delegate_runtime.progress import wait_with_progress
 
 __all__ = [
     "BackendError",
@@ -84,4 +85,5 @@ __all__ = [
     "build_subagent_stop_payload",
     "strip_child_entry_metadata",
     "sum_child_costs",
+    "wait_with_progress",
 ]

@@ -25,6 +25,14 @@ impl Tool for FileReadTool {
                     "path": {
                         "type": "string",
                         "description": "Path to the file (relative to work_dir or absolute within work_dir)"
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to read (default 102400). Prevents context blowup on large files."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset to start reading from (default 0). Use for pagination."
                     }
                 },
                 "required": ["path"]
@@ -65,8 +73,27 @@ impl Tool for FileReadTool {
         let canonical =
             resolve_read_path(path_str, &ctx.work_dir).map_err(ToolError::InvalidInput)?;
         let content = fs::read_to_string(&canonical).await?;
+        // 截断：防止大文件撑爆上下文
+        let max_bytes = input["max_bytes"].as_u64().unwrap_or(102400) as usize;
+        let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+        let bytes = content.as_bytes();
+        let total = bytes.len();
+        let output = if offset >= total {
+            String::new()
+        } else {
+            let end = (offset + max_bytes).min(total);
+            let truncated = end < total;
+            let mut s = String::from_utf8_lossy(&bytes[offset..end]).into_owned();
+            if truncated {
+                s.push_str(&format!(
+                    "\n... [truncated: showing bytes {}-{} of {}, use offset={} to continue]",
+                    offset, end, total, end
+                ));
+            }
+            s
+        };
         Ok(ToolResult {
-            output: content,
+            output,
             is_error: false,
         })
     }
