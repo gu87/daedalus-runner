@@ -129,6 +129,35 @@ class LocalBackend:
         return self._list_running_fn()
 
 
+def ensure_daedalus_alive(*, base_url="http://127.0.0.1:9800", proxy_url="http://127.0.0.1:8899", start_script="/home/hatch/workspace/daedalus-runner/scripts/start-all.sh"):
+    """派活前自检：daemon 和代理挂了就拉起来。跑在调用方进程里，死不了。"""
+    import os as _os
+    if _os.environ.get("DAEDALUS_NO_AUTOHEAL"):
+        return True
+    import subprocess as _sp
+    import urllib.request as _ur
+
+    def _ok(url, timeout=5):
+        try:
+            with _ur.urlopen(url, timeout=timeout) as r:
+                return 200 <= r.status < 500
+        except Exception:
+            return False
+
+    daemon_ok = _ok(base_url + "/api/health")
+    proxy_ok = _ok(proxy_url + "/v1/models")
+    if daemon_ok and proxy_ok:
+        return True
+    # 拉起
+    try:
+        _sp.run(["bash", start_script], timeout=30, capture_output=True)
+    except Exception:
+        pass
+    import time as _t
+    _t.sleep(3)
+    return _ok(base_url + "/api/health") and _ok(proxy_url + "/v1/models")
+
+
 class DaedalusBackend:
     def __init__(
         self,
@@ -150,6 +179,7 @@ class DaedalusBackend:
         return True
 
     def dispatch(self, spec: TaskSpec) -> str:
+        ensure_daedalus_alive(base_url=self.base_url)
         data = self._request("POST", "/api/tasks", asdict(spec))
         run_id = data.get("run_id") or data.get("task_id") or data.get("id")
         if not run_id:
