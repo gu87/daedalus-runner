@@ -9,6 +9,9 @@ UPSTREAM = "https://opencode.ai/zen/go"
 CRED = "custom.opencode-go"
 HOSTS = ["opencode.ai"]
 
+# usage 账本落盘位置：放仓库内持久目录，VM 重启不丢（/tmp 会被清空）
+USAGE_LOG = "/home/hatch/workspace/daedalus-runner/logs/llm_usage.log"
+
 TAVILY_UPSTREAM = "https://api.tavily.com"
 TAVILY_CRED = "custom.tavily"
 TAVILY_HOSTS = ["api.tavily.com"]
@@ -72,18 +75,46 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = _forward
     do_DELETE = _forward
     def _log_usage(self, data):
-        """从 API 响应里扒 usage，记到 /tmp/llm_usage.log"""
+        """从 API 响应里扒 usage，记到账本。
+        兼容两种响应形态：
+        - 普通 JSON（chat.completions 非流式）
+        - SSE 流式（daemon 实际走这个：逐个 data chunk 里找带 usage 的尾包）
+        """
         try:
-            import json as _json, time as _time
-            obj = _json.loads(data)
-            usage = obj.get("usage") or {}
-            model = obj.get("model", "unknown")
-            pt = usage.get("prompt_tokens", 0)
-            ct = usage.get("completion_tokens", 0)
+            import json as _json, time as _time, os as _os
+            if isinstance(data, (bytes, bytearray)):
+                text = bytes(data).decode("utf-8", "replace")
+            else:
+                text = data
+            usage = {}
+            model = "unknown"
+            try:
+                obj = _json.loads(text)
+                usage = obj.get("usage") or {}
+                model = obj.get("model", "unknown")
+            except Exception:
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    try:
+                        chunk = _json.loads(payload)
+                    except Exception:
+                        continue
+                    if chunk.get("model"):
+                        model = chunk["model"]
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+            pt = usage.get("prompt_tokens", 0) or 0
+            ct = usage.get("completion_tokens", 0) or 0
             if pt or ct:
+                _os.makedirs(_os.path.dirname(USAGE_LOG), exist_ok=True)
                 line = "%d %s prompt=%d completion=%d total=%d\n" % (
                     int(_time.time()), model, pt, ct, pt + ct)
-                with open("/tmp/llm_usage.log", "a") as f:
+                with open(USAGE_LOG, "a") as f:
                     f.write(line)
         except Exception:
             pass

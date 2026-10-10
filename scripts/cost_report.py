@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""成本看板：解析 /tmp/llm_usage.log，按天/模型汇总 token 和估算费用。"""
+"""成本看板：解析 llm_usage.log，按天/模型汇总 token 和估算费用。"""
 import sys
 from collections import defaultdict
 from datetime import datetime
+
+# 新路径（持久，VM 重启不丢）在前，旧路径（/tmp，重启清空）兜底合并
+LOG_PATHS = [
+    "/home/hatch/workspace/daedalus-runner/logs/llm_usage.log",
+    "/tmp/llm_usage.log",
+]
 
 # 模型价格 ($/1M tokens)，按 opencode-go 2026-10 水平估算
 PRICES = {
@@ -14,10 +20,14 @@ PRICES = {
 }
 
 def main():
-    log = "/tmp/llm_usage.log"
-    try:
-        lines = open(log).read().strip().split("\n")
-    except FileNotFoundError:
+    lines = []
+    for log in LOG_PATHS:
+        try:
+            lines += open(log).read().strip().split("\n")
+        except FileNotFoundError:
+            continue
+    lines = [l for l in lines if l.strip()]
+    if not lines:
         print("暂无用量记录")
         return
     by_day_model = defaultdict(lambda: defaultdict(lambda: [0, 0]))  # day -> model -> [prompt, completion]
