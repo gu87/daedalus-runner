@@ -7,7 +7,7 @@
 //! - [`ToolRegistry`] — name → tool lookup (in [`registry`]).
 //!
 //! Four built-in tools ship in Phase 2:
-//! [`file_read`], [`file_write`], [`terminal`], [`task_done`].
+//! [`file_read`], [`file_write`], [`terminal`], [`task_done`], [`web_fetch`].
 
 pub mod file_read;
 pub mod file_write;
@@ -15,6 +15,7 @@ pub mod narrative;
 pub mod registry;
 pub mod task_done;
 pub mod terminal;
+pub mod web_fetch;
 
 use std::path::PathBuf;
 

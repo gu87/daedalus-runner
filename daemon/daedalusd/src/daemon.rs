@@ -54,6 +54,7 @@ pub fn build_default_tool_registry() -> Result<ToolRegistry, DaedalusError> {
         Arc::new(crate::tools::file_write::FileWriteTool),
         Arc::new(crate::tools::terminal::TerminalTool),
         Arc::new(crate::tools::task_done::TaskDoneTool),
+        Arc::new(crate::tools::web_fetch::WebFetchTool),
     ] {
         registry
             .register(tool)
