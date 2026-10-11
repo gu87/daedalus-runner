@@ -77,3 +77,22 @@ result = b.get_result(rid)  # 轮询
 
 - `daemon/target/` 未包含，重编：`cd daemon && cargo build`
 - 原仓库（gu87/daedalus、gu87/hermes-delegate-runtime）保留不动，这是本地统一工作区
+
+## 已知问题（2026-10-11 Codex 代码审查）
+
+总体评价：5/10 —— 模块划分清楚，但进程管理、并发文件操作和终态一致性有缺口，适合受控的小规模任务。
+
+### Major（19个，摘录最要命的5个）
+1. 工具调用顺序错乱：task_done 可能比 file_write 先执行（llm/openai_compat.rs:326）
+2. terminal 安全绕过：禁用命令只检查首个 token，`echo ok; rm` 可绕过（tools/terminal.rs:76）
+3. 大文件内存爆炸：max_bytes 是读完整个文件才截断（tools/file_read.rs:75）
+4. 整数溢出 panic：offset + max_bytes 未检查溢出（tools/file_read.rs:84）
+5. 任务取消杀不干净：子进程继续跑，可能和重试打架（tools/terminal.rs:95）
+
+### Minor（6个，略）
+- web_fetch/web_search 不检查 HTTP 错误状态
+- file_write 用字符串前缀匹配 must_keep 会误伤
+- 等等，详见 issue 跟踪
+
+### 定位
+实验代码当生产用，适合跑腿小杂活，不适合 7x24 高并发。挂了有巡检自动拉起。
